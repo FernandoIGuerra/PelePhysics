@@ -44,6 +44,7 @@
 #include <sunlinsol/sunlinsol_cusolversp_batchqr.h>
 #endif
 
+
 // CYOrder is faster on GPUs, but only works for cvode.solve_type=GMRES.
 // We default to CYOrder in the specific case below,
 // while defining PELE_CVODE_FORCE_YCORDER enables more solvers but less GMRES
@@ -91,6 +92,24 @@ public:
     amrex::gpuStream_t stream
 #endif
     ) override;
+//--------------------------- CLEM IMPLEMENTATION -------------------------
+
+  int reactClemParticles(
+      std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>& primitives,
+      std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>& conservatives,
+      std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>& rhs,
+      std::array<amrex::Real, NUM_LEM>& density,
+      amrex::Real& dt_react,
+      amrex::Real& time
+  #ifdef AMREX_USE_GPU
+        ,
+        amrex::gpuStream_t stream
+  #endif
+      ) override;
+
+
+//--------------------------- CLEM IMPLEMENTATION -------------------------
+
 
   int react(
     amrex::Real* rY_in,

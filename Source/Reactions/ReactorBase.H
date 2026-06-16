@@ -9,6 +9,8 @@
 #include "mechanism.H"
 #include "ReactorUtils.H"
 
+#include "ClemParticles/clem_index_definition.H"
+
 namespace pele::physics::reactions {
 
 class ReactorBase : public Factory<ReactorBase>
@@ -38,6 +40,19 @@ public:
     amrex::gpuStream_t stream
 #endif
     ) = 0;
+//--------------------------- CLEM IMPLEMENTATION -------------------------
+  virtual int reactClemParticles(
+      std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>& primitives,
+      std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>& conservatives,
+      std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>& rhs,
+      std::array<amrex::Real, NUM_LEM>& density,
+      amrex::Real& dt_react,
+      amrex::Real& time
+  #ifdef AMREX_USE_GPU
+        ,amrex::gpuStream_t stream
+  #endif
+      ) = 0;
+//--------------------------- CLEM IMPLEMENTATION -------------------------
 
   virtual int react(
     amrex::Real* rY_in,

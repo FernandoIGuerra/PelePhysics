@@ -1264,7 +1264,108 @@ ReactorCvode::allocUserData(
   }
 #endif
 }
+//--------------------------- CLEM IMPLEMENTATION -------------------------
 
+
+int ReactorCvode::reactClemParticles(
+    std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>& primitives,
+    std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>& conservatives,
+    std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>& rhs,
+    std::array<amrex::Real, NUM_LEM>& density,
+    amrex::Real& dt_react,
+    amrex::Real& time
+#ifdef AMREX_USE_GPU
+      ,
+      amrex::gpuStream_t stream
+#endif
+)
+{
+    amrex::Real time_start = time;
+    amrex::Real time_final = time + dt_react;
+    amrex::Real CvodeActual_time_final = 0.0;
+  #ifdef SUNDIALS_BUILD_WITH_PROFILING
+    SUNProfiler sun_profiler = nullptr;
+    SUNContext_GetProfiler( *amrex::sundials::The_Sundials_Context(), &sun_profiler);
+  #endif
+    SUNMatrix A = nullptr;             // Jacobian matrix
+    auto* udata = new CVODEUserData{}; // Userdata container
+    SUNNonlinearSolver NLS = nullptr;  // Non-linear solver
+    SUNLinearSolver LS = nullptr;      // Linear solver
+
+    // Call CVodeCreate to create the solver memory and specify the Backward
+    // Differentiation Formula and the use of a Newton iteration
+    void* cvode_mem = CVodeCreate(CV_BDF, *amrex::sundials::The_Sundials_Context());
+    N_Vector y = nullptr; // Solution vector
+
+    const int icell = 0;
+    const int ncells = 1;
+
+    int omp_thread = 0;
+    #ifdef AMREX_USE_OMP
+      omp_thread = omp_get_thread_num();
+    #endif
+
+    initCvode(y, A, udata, NLS, LS, cvode_mem, time_start, ncells);
+    utils::set_sundials_solver_tols<Ordering>( *amrex::sundials::The_Sundials_Context(), cvode_mem, udata->ncells, relTol,absTol, m_typ_vals, "cvode", verbose);
+
+    const auto captured_reactor_type          = m_reactor_type;
+    const auto captured_clean_init_massfrac   = m_clean_init_massfrac;
+
+    const int numLem = NUM_LEM;
+    for(int lem = 0; lem < numLem; lem++){
+      amrex::Real* yvec_d = N_VGetArrayPointer(y);
+      utils::clemParticle_flatten<Ordering>(icell, ncells,lem, primitives, conservatives, rhs, captured_reactor_type, captured_clean_init_massfrac,yvec_d, udata->rYsrc_ext, udata->rhoe_init, udata->rhoesrc_ext);
+      CVodeReInit(cvode_mem, time_start, y);
+      CVode(cvode_mem, time_final, y, &CvodeActual_time_final, CV_NORMAL);
+      if ((udata->verbose > 1) && (omp_thread == 0)) {
+          amrex::Print() << "Additional verbose info --\n";
+          print_final_stats(cvode_mem, LS != nullptr);
+          amrex::Print() << "\n -------------------------------------\n";
+      }
+      amrex::Real actual_dt = CvodeActual_time_final - time_start;
+
+      long int nfe = 0;
+      long int nfeLS = 0;
+      CVodeGetNumRhsEvals(cvode_mem, &nfe);
+      if (LS != nullptr) {
+        CVodeGetNumLinRhsEvals(cvode_mem, &nfeLS);
+      }
+
+      const long int nfe_tot = nfe + nfeLS;
+      utils::clemParticle_unflatten<Ordering>(icell, ncells, lem, primitives, conservatives, rhs, captured_reactor_type, captured_clean_init_massfrac, yvec_d, udata->rhoe_init ,dt_react );
+      if ((udata->verbose > 3) && (omp_thread == 0)) {
+        amrex::Print() << "END : time curr is " << CvodeActual_time_final << " and actual dt_react is " << actual_dt << "\n";
+      }
+    }
+
+    long int nfe = 20; // Dummy, the return value is no longer used for this function.
+    #ifdef SUNDIALS_BUILD_WITH_PROFILING
+    if (m_print_profiling) {
+        SUNProfiler_Print(sun_profiler, stdout);
+    }
+    #endif
+
+      // Clean up
+    N_VDestroy(y);
+    CVodeFree(&cvode_mem);
+    if (LS != nullptr) {
+      SUNLinSolFree(LS);
+    }
+    if (NLS != nullptr) {
+      SUNNonlinSolFree(NLS);
+    }
+    if (A != nullptr) {
+      SUNMatDestroy(A);
+    }
+    freeUserData(udata);
+
+
+    return 0;
+}
+      
+
+
+//--------------------------- CLEM IMPLEMENTATION -------------------------
 int
 ReactorCvode::react(
   const amrex::Box& box,
