@@ -1,6 +1,8 @@
 #ifndef REACTORCVODE_H
 #define REACTORCVODE_H
 
+#include <array>
+
 #include "AMReX_Sundials.H"
 #include "ReactorBase.H"
 #include "ReactorCvodeUtils.H"
@@ -109,6 +111,53 @@ public:
   static int
   cF_RHS(amrex::Real t, N_Vector y_in, N_Vector ydot, void* user_data);
 
+  //--------------------------- CLEM IMPLEMENTATION -------------------------
+  // Fernando-Clem: PERSISTENT, batched LEM-line reactor. Unlike the standard
+  // react() calls above (which build a full CVODE context - matrix, linear/
+  // nonlinear solver, user data - and tear it down every invocation, fine
+  // when called once per box per step), a naive per-LEM-line port would call
+  // that create/init/free cycle once per LES CELL, every CLEM step - for a
+  // 256-cell 1-D case that is 256x the solver setup/teardown churn per step
+  // for no numerical benefit (the systems are independent; batching them
+  // costs nothing but memory). Here the CVODE context is built ONCE (lazily,
+  // on the first initClemReactor(NUM_LEM) call - conventionally one instance
+  // per rank/thread, matching how ClemDiffusion's LineScratch::get() owns one
+  // persistent scratch arena per rank) and reused via CVodeReInit for every
+  // subsequent line, exactly like the standard react() path already reuses
+  // its context across the ncells of one box. reactClemLine bundles all
+  // NUM_LEM elements of one line into ONE batched CVode solve (icell = lem,
+  // ncells = NUM_LEM) instead of NUM_LEM separate ncells=1 solves.
+  //
+  // Scope note (2026-07): wired to Source/Clem via ReactionOperator
+  // (ClemReaction.H/.cpp), called from ClemAlgorithm::advance AFTER the
+  // diffusion stage (sequential/Lie splitting, clem.do_react).
+  void initClemReactor(int ncells);
+
+  // Fernando-Clem: integrates the batched line over [time, time+dt_react]
+  // using a WHILE loop, not a single fire-and-forget CVode() call - mirrors
+  // Maxwell's own sub-cycle structure ([M §3.3.3] steps 14-20: compute a
+  // substep, integrate, advance t, repeat until the interval is covered).
+  // The substep is decided fresh each iteration from what CVODE actually
+  // achieves: the full dt_react is tried first, and only on a genuine CVode
+  // failure (flag<0 - one stiff element in the BATCH exceeded CVODE's
+  // internal step/accuracy limits) is the sub-target halved and retried from
+  // the same t_now, growing back afterward. This guarantees the full
+  // dt_react is always covered (or the run aborts loudly after max_retries
+  // halvings) - never a silent partial integration. Returns the number of
+  // halving retries needed (0 = clean single-shot).
+  int reactClemLine(
+    std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>&
+      primitives,
+    std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>&
+      conservatives,
+    std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>& rhs,
+    std::array<amrex::Real, NUM_LEM>& density,
+    amrex::Real& dt_react,
+    amrex::Real& time);
+
+  void closeClemReactor();
+  //--------------------------- CLEM IMPLEMENTATION -------------------------
+
   void flatten(
     const amrex::Box& box,
     const int ncells,
@@ -175,6 +224,21 @@ private:
 #endif
   ) const;
   static void freeUserData(CVODEUserData* data_wk);
+
+  //--------------------------- CLEM IMPLEMENTATION -------------------------
+  // Fernando-Clem: the persistent CVODE context for reactClemLine - built
+  // once by initClemReactor, torn down once by closeClemReactor (also called
+  // from close()). See the reactClemLine comment above for why this is
+  // persistent rather than per-call like the other react() overloads.
+  bool m_clem_initialized{false};
+  int m_clem_ncells{0};
+  void* m_clem_cvode_mem{nullptr};
+  N_Vector m_clem_y{nullptr};
+  SUNMatrix m_clem_A{nullptr};
+  CVODEUserData* m_clem_udata{nullptr};
+  SUNNonlinearSolver m_clem_NLS{nullptr};
+  SUNLinearSolver m_clem_LS{nullptr};
+  //--------------------------- CLEM IMPLEMENTATION -------------------------
 
   amrex::Real relTol{1e-6};
   amrex::Real absTol{1e-10};

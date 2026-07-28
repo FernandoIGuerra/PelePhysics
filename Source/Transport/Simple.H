@@ -170,7 +170,7 @@ struct BinaryDiff
     }
   }
 };
-
+//D * rho
 template <>
 struct BinaryDiff<eos::SRK>
 {

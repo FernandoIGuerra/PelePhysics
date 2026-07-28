@@ -1,6 +1,7 @@
 #ifndef REACTORUTILS_H
 #define REACTORUTILS_H
 
+#include <array>
 #include <utility>
 #include <AMReX_Gpu.H>
 #include "mechanism.H"
@@ -25,6 +26,8 @@
 #ifdef AMREX_USE_CUDA
 #include <nvector/nvector_cuda.h>
 #endif
+
+#include "ReactorClemConfig.H"
 
 namespace pele::physics::reactions::utils {
 int check_flag(void* flagvalue, const char* funcname, int opt);
@@ -288,6 +291,156 @@ box_unflatten(
   }
   temperature(i, j, k, 0) = temp;
   FC_in(i, j, k, 0) = static_cast<amrex::Real>(FCunt);
+}
+
+// Fernando-Clem: CLEM LEM-line flatten/unflatten, mirroring box_flatten/
+// box_unflatten above but reading/writing a LEM line's elements (indexed by
+// `lem`) instead of an AMReX Array4 cell (i,j,k). `icell` is the element's
+// SLOT in the batched CVODE vector (see ReactorCvode::reactClemLine, which
+// reacts all NUM_LEM elements of one line as one batched system - icell=lem,
+// ncells=NUM_LEM). primitives[lem][NUM_SPECIES] carries T (only used as a
+// fallback/diagnostic - the actual initial T is recomputed from energy
+// below); conservatives[lem][0..NUM_SPECIES-1] = rho*Y_k, [NUM_SPECIES] =
+// rho*eint; rhs[lem][*] is the external (non-reactive) source for the step.
+template <typename OrderType>
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE void
+clemParticle_flatten(
+  const int icell,
+  const int ncells,
+  const int lem,
+  std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>& primitives,
+  std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>&
+    conservatives,
+  std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>&
+    rhs, // This is the non reactive source
+  const int reactor_type,
+  const bool clean_init_massfrac,
+  amrex::Real* y_vect,
+  amrex::Real* src_vect,
+  amrex::Real* vect_energy,
+  amrex::Real* src_vect_energy)
+{
+  amrex::Real mass_frac[NUM_SPECIES];
+  amrex::Real rho = 0.0;
+  amrex::Real rho_old = 0.0;
+
+  if (clean_init_massfrac) {
+    for (int n = 0; n < NUM_SPECIES; n++) {
+      rho_old += conservatives[lem][n];
+    }
+  }
+
+  for (int sp = 0; sp < NUM_SPECIES; sp++) {
+    const int idx = vec_index<OrderType>(sp, icell, ncells);
+    const int idx2 = spec_index<OrderType>(sp, icell, ncells);
+    // Verify if sum(rhoY_k) = rho
+    const amrex::Real rhoYn =
+      (clean_init_massfrac) ? amrex::min<amrex::Real>(
+                                 amrex::max<amrex::Real>(
+                                   0.0, conservatives[lem][sp]),
+                                 rho_old)
+                             : conservatives[lem][sp];
+    y_vect[idx] = rhoYn;
+    src_vect[idx2] = rhs[lem][sp];
+    rho += rhoYn;
+    mass_frac[sp] = rhoYn;
+  }
+
+  const amrex::Real rho_inv = 1.0 / rho;
+  for (amrex::Real& Yn : mass_frac) {
+    Yn *= rho_inv;
+  }
+
+  amrex::Real temp = primitives[lem][NUM_SPECIES];
+  vect_energy[icell] = conservatives[lem][NUM_SPECIES]; // rhoEint
+  src_vect_energy[icell] = rhs[lem][NUM_SPECIES];        // energy source
+
+  amrex::Real Enrg_loc = vect_energy[icell] * rho_inv;
+  auto eos = pele::physics::PhysicsType::eos();
+  if (reactor_type == ReactorTypes::e_reactor_type) {
+    eos.REY2T(rho, Enrg_loc, mass_frac, temp);
+  } else if (reactor_type == ReactorTypes::h_reactor_type) {
+    eos.RHY2T(rho, Enrg_loc, mass_frac, temp);
+  } else {
+    amrex::Abort("Wrong reactor type. Choose between 1 (e) or 2 (h).");
+  }
+  y_vect[vec_index<OrderType>(NUM_SPECIES, icell, ncells)] = temp;
+}
+
+// Fernando-Clem: inverse of clemParticle_flatten - reads the post-integration
+// batched CVODE vector back into conservatives[lem] (rho*Y_k, rho*eint =
+// OLD energy + dt * external source only - the reaction itself conserves
+// rho*eint by construction of the reactor_type, chemical energy release
+// shows up through the evolved T/Y instead) and primitives[lem][NUM_SPECIES]
+// (T, EOS-recomputed from the final (rho, e, Y) for consistency).
+template <typename OrderType>
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE void
+clemParticle_unflatten(
+  const int icell,
+  const int ncells,
+  const int lem,
+  std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>& primitives,
+  std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>&
+    conservatives,
+  std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>&
+    rhs, // This is the non reactive source
+  const int reactor_type,
+  const bool clean_init_massfrac,
+  const amrex::Real* y_vect,
+  const amrex::Real* vect_energy,
+  amrex::Real dt)
+{
+  amrex::Real rhoY_oldclipped[NUM_SPECIES];
+  amrex::Real rho_old = 0.0;
+  amrex::Real rho_oldclipped = 0.0;
+
+  if (clean_init_massfrac) {
+    for (int sp = 0; sp < NUM_SPECIES; sp++) {
+      rho_old += conservatives[lem][sp];
+    }
+    for (int sp = 0; sp < NUM_SPECIES; sp++) {
+      rhoY_oldclipped[sp] = amrex::min<amrex::Real>(
+        amrex::max<amrex::Real>(0.0, conservatives[lem][sp]), rho_old);
+      rho_oldclipped += rhoY_oldclipped[sp];
+    }
+  }
+
+  amrex::Real mass_frac[NUM_SPECIES];
+  amrex::Real rho = 0.0;
+  for (int sp = 0; sp < NUM_SPECIES; sp++) {
+    // With clean_init_massfrac, new rhoY equal old one + CVODE increment
+    const amrex::Real rhoYn =
+      (clean_init_massfrac)
+        ? conservatives[lem][sp] +
+            (y_vect[vec_index<OrderType>(sp, icell, ncells)] -
+             rhoY_oldclipped[sp]) *
+              rho_old / rho_oldclipped
+        : y_vect[vec_index<OrderType>(sp, icell, ncells)];
+    conservatives[lem][sp] = rhoYn;
+    rho += rhoYn;
+    mass_frac[sp] = rhoYn;
+  }
+
+  const amrex::Real rho_inv = 1.0 / rho;
+  for (amrex::Real& Yn : mass_frac) {
+    Yn *= rho_inv;
+  }
+
+  amrex::Real temp = y_vect[vec_index<OrderType>(NUM_SPECIES, icell, ncells)];
+  conservatives[lem][NUM_SPECIES] =
+    vect_energy[icell] + dt * rhs[lem][NUM_SPECIES];
+
+  amrex::Real Enrg_loc = conservatives[lem][NUM_SPECIES] * rho_inv;
+
+  auto eos = pele::physics::PhysicsType::eos();
+  if (reactor_type == ReactorTypes::e_reactor_type) {
+    eos.REY2T(rho, Enrg_loc, mass_frac, temp);
+  } else if (reactor_type == ReactorTypes::h_reactor_type) {
+    eos.RHY2T(rho, Enrg_loc, mass_frac, temp);
+  } else {
+    amrex::Abort("Wrong reactor type. Choose between 1 (e) or 2 (h).");
+  }
+  primitives[lem][NUM_SPECIES] = temp;
 }
 
 template <typename OrderType>

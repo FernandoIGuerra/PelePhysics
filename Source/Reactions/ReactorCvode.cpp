@@ -1835,7 +1835,192 @@ ReactorCvode::freeUserData(CVODEUserData* data_wk)
 void
 ReactorCvode::close()
 {
+  closeClemReactor();
 }
+
+//--------------------------- CLEM IMPLEMENTATION -------------------------
+
+void
+ReactorCvode::initClemReactor(const int ncells)
+{
+  BL_PROFILE("Pele::ReactorCvode::initClemReactor()");
+  if (m_clem_initialized) {
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+      m_clem_ncells == ncells,
+      "ReactorCvode::initClemReactor: already initialized with a "
+      "different ncells - the persistent CVODE context is sized once "
+      "and cannot be resized. NUM_LEM (ReactorClemConfig.H) must be "
+      "constant for the run.");
+    return;
+  }
+
+  m_clem_ncells     = ncells;
+  m_clem_udata      = new CVODEUserData{};
+  m_clem_cvode_mem  = CVodeCreate(CV_BDF, *amrex::sundials::The_Sundials_Context());
+
+  // Fernando-Clem: m_clem_udata->{solve_type,analytical_jacobian,
+  // precond_type} are set from m_solve_type/m_analytical_jacobian/
+  // m_precond_type inside allocUserData (called by initCvode below), which
+  // in turn come from checkCvodeOptions in init() - so init(reactor_type,..)
+  // MUST be called before initClemReactor (same contract the standard react()
+  // path already has).
+  const amrex::Real time_start = 0.0; // overwritten by CVodeReInit every call
+  initCvode( m_clem_y, m_clem_A, m_clem_udata, m_clem_NLS, m_clem_LS, m_clem_cvode_mem, time_start, ncells);
+  
+  utils::set_sundials_solver_tols<Ordering>( *amrex::sundials::The_Sundials_Context(), m_clem_cvode_mem,
+                                              m_clem_udata->ncells, relTol, absTol, m_typ_vals, "cvode", verbose);
+
+  m_clem_initialized = true;
+}
+
+int
+ReactorCvode::reactClemLine(
+  std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>& primitives,
+  std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>&conservatives,
+  std::array<std::array<amrex::Real, NUM_SPECIES + 1>, NUM_LEM>& rhs,
+  std::array<amrex::Real, NUM_LEM>& /*density*/,
+  amrex::Real& dt_react,
+  amrex::Real& time)
+{
+  BL_PROFILE("Pele::ReactorCvode::reactClemLine()");
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    m_clem_initialized,
+    "ReactorCvode::reactClemLine: call initClemReactor(NUM_LEM) first");
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+    m_clem_ncells == NUM_LEM,
+    "ReactorCvode::reactClemLine: persistent context was not sized for "
+    "NUM_LEM elements");
+
+  const amrex::Real time_start        = time;
+  const amrex::Real time_final        = time + dt_react;
+  amrex::Real CvodeActual_time_final  = 0.0;
+
+  const int ncells      = NUM_LEM;
+  amrex::Real* yvec_d   = N_VGetArrayPointer(m_clem_y);
+
+  const auto captured_reactor_type          = m_reactor_type;
+  const auto captured_clean_init_massfrac   = m_clean_init_massfrac;
+
+  // Fernando-Clem: pack ALL NUM_LEM elements into ONE batched CVODE vector -
+  // icell (slot in the batch) = lem (particle index): each line element gets
+  // its own independent block in the flattened system, exactly the pattern
+  // box_flatten already uses per (i,j,k) cell of a box. The systems do not
+  // couple (reaction is local), so batching is exact, not an approximation -
+  // it only changes how many solver-setup cycles the whole line costs (one,
+  // not NUM_LEM).
+  for (int lem = 0; lem < ncells; ++lem) {
+    utils::clemParticle_flatten<Ordering>(
+      lem, ncells, lem, primitives, conservatives, rhs, captured_reactor_type,
+      captured_clean_init_massfrac, yvec_d, m_clem_udata->rYsrc_ext,
+      m_clem_udata->rhoe_init, m_clem_udata->rhoesrc_ext);
+  }
+
+  // Fernando-Clem: ReInit (not Create) - the whole point of the persistent
+  // context. Cheap: resets CVODE's internal step-history/order state to a
+  // fresh start at time_start without touching the linear/nonlinear solver
+  // or matrix setup done once in initClemReactor.
+  CVodeReInit(m_clem_cvode_mem, time_start, m_clem_y);
+
+  // Fernando-Clem: WHILE loop, NOT a pre-divided for-loop like
+  // DiffusionOperator's fixed n_sub = dt/dt_cfl. Mirrors Maxwell's own
+  // sub-cycle structure ([M §3.3.3] steps 14-20: compute a substep, integrate,
+  // advance t, repeat until the full interval is covered) - the substep is
+  // decided FRESH each iteration from what CVODE actually achieves, not fixed
+  // up front. A single call for the FULL dt_react is tried first (the common
+  // case, since CV_NORMAL internally sub-steps and only reports failure, not
+  // "ran out of a pre-allocated budget"); only on genuine FAILURE (flag < 0 -
+  // one stiff element in the BATCHED system exceeded CVODE's internal step/
+  // accuracy limits; batching n_lem independent systems means the worst one
+  // governs the whole line, so this is more likely here than for a single
+  // cell) do we halve the sub-target and retry from the same t_now. This is a
+  // graceful degradation, not the hard abort the standard box react() path
+  // uses (utils::check_flag(&flag,"CVode",1) there) - a stiff LEM element
+  // should cost extra substeps, not crash the whole run.
+  amrex::Real t_now = time_start;
+  amrex::Real dt_sub = dt_react;
+  int n_retries = 0;
+  constexpr int max_retries = 20; // dt_sub floor = dt_react / 2^20
+  constexpr amrex::Real time_tol = 1.0e-12;
+  while (t_now < time_final - time_tol * dt_react) {
+    const amrex::Real t_target = std::min(t_now + dt_sub, time_final);
+    amrex::Real t_reached = t_now;
+    const int flag =
+      CVode(m_clem_cvode_mem, t_target, m_clem_y, &t_reached, CV_NORMAL);
+    if (flag < 0) {
+      ++n_retries;
+      if (n_retries > max_retries) {
+        amrex::Abort(
+          "ReactorCvode::reactClemLine: CVode could not integrate this LEM "
+          "line even at the minimum substep (dt_react/2^20) - check the "
+          "mechanism, dt, or ode.rtol/atol.");
+      }
+      dt_sub *= 0.5;
+      continue; // retry from the SAME t_now with the smaller sub-target
+    }
+    t_now = t_reached;
+    // Fernando-Clem: a clean success is evidence the step size is fine again
+    // - grow dt_sub back toward the full requested interval (capped), so a
+    // transiently stiff period (e.g. near ignition) does not permanently
+    // shrink every later substep of this line
+    dt_sub = std::min(dt_sub * 2.0, dt_react);
+  }
+  CvodeActual_time_final = t_now;
+
+  if (m_clem_udata->verbose > 1) {
+    amrex::Print() << "Additional verbose info --\n";
+    print_final_stats(m_clem_cvode_mem, m_clem_LS != nullptr);
+    amrex::Print() << "\n -------------------------------------\n";
+  }
+
+  for (int lem = 0; lem < ncells; ++lem) {
+    utils::clemParticle_unflatten<Ordering>(
+      lem, ncells, lem, primitives, conservatives, rhs, captured_reactor_type,
+      captured_clean_init_massfrac, yvec_d, m_clem_udata->rhoe_init,
+      dt_react);
+  }
+
+  if (m_clem_udata->verbose > 3) {
+    amrex::Print() << "END : time curr is " << CvodeActual_time_final
+                   << " and actual dt_react is "
+                   << (CvodeActual_time_final - time_start) << "\n";
+  }
+
+  // Fernando-Clem: number of substep-halving retries this line needed (0 =
+  // clean single-shot to the full dt_react). A persistently nonzero count
+  // across many lines/steps signals the mechanism/dt/tolerances need
+  // attention, even though the loop above guarantees the integration itself
+  // completed (or aborted loudly, never silently truncated).
+  return n_retries;
+}
+
+void
+ReactorCvode::closeClemReactor()
+{
+  if (!m_clem_initialized) {
+    return;
+  }
+  N_VDestroy(m_clem_y);
+  CVodeFree(&m_clem_cvode_mem);
+  if (m_clem_LS != nullptr) {
+    SUNLinSolFree(m_clem_LS);
+  }
+  if (m_clem_NLS != nullptr) {
+    SUNNonlinSolFree(m_clem_NLS);
+  }
+  if (m_clem_A != nullptr) {
+    SUNMatDestroy(m_clem_A);
+  }
+  freeUserData(m_clem_udata);
+  m_clem_y = nullptr;
+  m_clem_cvode_mem = nullptr;
+  m_clem_LS = nullptr;
+  m_clem_NLS = nullptr;
+  m_clem_A = nullptr;
+  m_clem_udata = nullptr;
+  m_clem_initialized = false;
+}
+
+//--------------------------- CLEM IMPLEMENTATION -------------------------
 
 void
 ReactorCvode::print_final_stats(void* cvodemem, bool print_ls_stats) // NOLINT
