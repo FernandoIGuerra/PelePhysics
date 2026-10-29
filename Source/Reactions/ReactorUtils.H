@@ -355,6 +355,122 @@ public:
   }
 };
 
+//--------------------------- CLEM IMPLEMENTATION -------------------------
+// ClemFlatten / ClemUnflatten: box_flatten / box_unflatten for ONE CLEM
+// element, the only cell (icell = 0) of an ncells = 1 CVODE vector. The
+// element comes in primitive form (rho, Y_k, T, specific energy: e for the e
+// reactor, h for the h reactor); the reactor type is a template parameter,
+// so no run-time branch. There is no external source: the line operators
+// (diffusion, stirring) are split from the reaction.
+
+// element -> CVODE vector: rho Y_k and T (from the EOS, the element T as the
+// first guess); rho energy and zero sources into the user data
+template <typename OrderType, int ReactorType>
+AMREX_FORCE_INLINE void
+ClemFlatten(
+  const bool clean_init_massfrac,
+  const amrex::Real rho,
+  const amrex::Real* mass_frac_in,
+  const amrex::Real temperature,
+  const amrex::Real energy,
+  amrex::Real* y_vect,
+  amrex::Real* src_vect,
+  amrex::Real* vect_energy,
+  amrex::Real* src_vect_energy)
+{
+  static_assert(
+    ReactorType == ReactorTypes::e_reactor_type ||
+      ReactorType == ReactorTypes::h_reactor_type,
+    "ClemFlatten: wrong reactor type, 1 (e) or 2 (h)");
+  constexpr int icell = 0;
+  constexpr int ncells = 1;
+
+  amrex::Real mass_frac[NUM_SPECIES];
+  amrex::Real rho_ode = 0.0;
+  for (int n = 0; n < NUM_SPECIES; n++) {
+    const amrex::Real rhoYn =
+      (clean_init_massfrac)
+        ? amrex::min<amrex::Real>(
+            amrex::max<amrex::Real>(0.0, rho * mass_frac_in[n]), rho)
+        : rho * mass_frac_in[n];
+    y_vect[vec_index<OrderType>(n, icell, ncells)] = rhoYn;
+    src_vect[spec_index<OrderType>(n, icell, ncells)] = 0.0;
+    rho_ode += rhoYn;
+    mass_frac[n] = rhoYn;
+  }
+  const amrex::Real rho_inv = 1.0 / rho_ode;
+  for (amrex::Real& Yn : mass_frac) {
+    Yn *= rho_inv;
+  }
+
+  vect_energy[icell] = rho * energy;
+  src_vect_energy[icell] = 0.0;
+
+  amrex::Real temp = temperature;
+  const amrex::Real Enrg_loc = vect_energy[icell] * rho_inv;
+  auto eos = pele::physics::PhysicsType::eos();
+  if constexpr (ReactorType == ReactorTypes::e_reactor_type) {
+    eos.REY2T(rho_ode, Enrg_loc, mass_frac, temp);
+  } else {
+    eos.RHY2T(rho_ode, Enrg_loc, mass_frac, temp);
+  }
+  y_vect[vec_index<OrderType>(NUM_SPECIES, icell, ncells)] = temp;
+}
+
+// CVODE vector -> element: the new Y_k (normalised by the integrated rho)
+// and T from the EOS at the held rho energy. mass_frac holds the OLD Y_k on
+// entry: with clean_init_massfrac the element gets old + CVODE increment, as
+// in box_unflatten
+template <typename OrderType, int ReactorType>
+AMREX_FORCE_INLINE void
+ClemUnflatten(
+  const bool clean_init_massfrac,
+  const amrex::Real rho,
+  const amrex::Real energy,
+  const amrex::Real* y_vect,
+  amrex::Real* mass_frac,
+  amrex::Real& temperature)
+{
+  constexpr int icell = 0;
+  constexpr int ncells = 1;
+
+  amrex::Real rhoY_oldclipped[NUM_SPECIES];
+  amrex::Real rho_oldclipped = 0.0;
+  if (clean_init_massfrac) {
+    for (int n = 0; n < NUM_SPECIES; n++) {
+      rhoY_oldclipped[n] = amrex::min<amrex::Real>(
+        amrex::max<amrex::Real>(0.0, rho * mass_frac[n]), rho);
+      rho_oldclipped += rhoY_oldclipped[n];
+    }
+  }
+
+  amrex::Real rhoY[NUM_SPECIES];
+  amrex::Real rho_ode = 0.0;
+  for (int n = 0; n < NUM_SPECIES; n++) {
+    const amrex::Real y_n = y_vect[vec_index<OrderType>(n, icell, ncells)];
+    rhoY[n] =
+      (clean_init_massfrac)
+        ? rho * mass_frac[n] + (y_n - rhoY_oldclipped[n]) * rho / rho_oldclipped
+        : y_n;
+    rho_ode += rhoY[n];
+  }
+  const amrex::Real rho_inv = 1.0 / rho_ode;
+  for (int n = 0; n < NUM_SPECIES; n++) {
+    mass_frac[n] = rhoY[n] * rho_inv;
+  }
+
+  amrex::Real temp = y_vect[vec_index<OrderType>(NUM_SPECIES, icell, ncells)];
+  const amrex::Real Enrg_loc = rho * energy * rho_inv;
+  auto eos = pele::physics::PhysicsType::eos();
+  if constexpr (ReactorType == ReactorTypes::e_reactor_type) {
+    eos.REY2T(rho_ode, Enrg_loc, mass_frac, temp);
+  } else {
+    eos.RHY2T(rho_ode, Enrg_loc, mass_frac, temp);
+  }
+  temperature = temp;
+}
+//--------------------------- CLEM IMPLEMENTATION -------------------------
+
 template <typename OrderType>
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE void
 fKernelSpec(

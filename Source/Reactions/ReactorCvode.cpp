@@ -1835,7 +1835,134 @@ ReactorCvode::freeUserData(CVODEUserData* data_wk)
 void
 ReactorCvode::close()
 {
+  CloseClemReactor();
 }
+
+//--------------------------- CLEM IMPLEMENTATION -------------------------
+
+void
+ReactorCvode::InitClemReactor()
+{
+  BL_PROFILE("Pele::ReactorCvode::InitClemReactor()");
+#ifdef AMREX_USE_GPU
+  amrex::Abort("ReactorCvode::InitClemReactor: the CLEM reactor is CPU only");
+#else
+
+  if (m_clem_initialized) {
+    return;
+  }
+
+  // allocUserData reads the solver options parsed by init()
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE( m_solve_type >= 0, "ReactorCvode::InitClemReactor: call init() first");
+
+  const int ncells  = 1;
+  m_clem_udata      = new CVODEUserData{};
+  m_clem_cvode_mem  = CVodeCreate(CV_BDF, *amrex::sundials::The_Sundials_Context());
+  if (initCvode( m_clem_y, m_clem_A, m_clem_udata, m_clem_NLS, m_clem_LS, m_clem_cvode_mem, 0.0, ncells) != 0) {
+    amrex::Abort("ReactorCvode::InitClemReactor: initCvode failed");
+  }
+  m_clem_initialized = true;
+  SetClemTolerances();
+#endif
+}
+
+void
+ReactorCvode::SetClemTolerances()
+{
+#ifndef AMREX_USE_GPU
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(m_clem_initialized, "ReactorCvode::SetClemTolerances: call InitClemReactor() first");
+  // with typical values atol_k = typ_k atol, without them atol for every unknown
+  utils::set_sundials_solver_tols<Ordering>( *amrex::sundials::The_Sundials_Context(), m_clem_cvode_mem,
+                                              m_clem_udata->ncells, relTol, absTol, m_typ_vals, "cvode", verbose);
+#endif
+}
+
+template <int ReactorType>
+int
+ReactorCvode::ReactClem(
+  const amrex::Real rho,
+  amrex::Real* mass_frac,
+  amrex::Real& temperature,
+  const amrex::Real energy,
+  const amrex::Real dt_react,
+  const amrex::Real time)
+{
+  BL_PROFILE("Pele::ReactorCvode::ReactClem()");
+#ifdef AMREX_USE_GPU
+  amrex::Abort("ReactorCvode::ReactClem: the CLEM reactor is CPU only");
+  return 0;
+#else
+
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(m_clem_initialized,"ReactorCvode::ReactClem: call InitClemReactor() first");
+  // the RHS (fKernelSpec) takes the type given to init()
+  AMREX_ALWAYS_ASSERT_WITH_MESSAGE(ReactorType == m_reactor_type,"ReactorCvode::ReactClem: reactor type differs from the one of init()");
+
+  amrex::Real* yvec = N_VGetArrayPointer(m_clem_y);
+
+  utils::ClemFlatten<Ordering, ReactorType>(
+    m_clean_init_massfrac, rho, mass_frac, temperature, energy, yvec,
+    m_clem_udata->rYsrc_ext, m_clem_udata->rhoe_init,
+    m_clem_udata->rhoesrc_ext);
+
+  // ReInit, not Create: the solvers and the matrix of InitClemReactor are kept
+  CVodeReInit(m_clem_cvode_mem, time, m_clem_y);
+
+  amrex::Real time_reached = time;
+  const int flag = CVode(m_clem_cvode_mem, time + dt_react, m_clem_y, &time_reached, CV_NORMAL);
+
+  if (flag < 0) {
+    amrex::Abort(
+      "ReactorCvode::ReactClem: CVODE failed on a CLEM element, flag " +
+      std::to_string(flag));
+  }
+
+  utils::ClemUnflatten<Ordering, ReactorType>( m_clean_init_massfrac, rho, energy, yvec, mass_frac, temperature);
+
+  long int nfe = 0;
+  long int nfe_ls = 0;
+  CVodeGetNumRhsEvals(m_clem_cvode_mem, &nfe);
+  if (m_clem_LS != nullptr) {
+    CVodeGetNumLinRhsEvals(m_clem_cvode_mem, &nfe_ls);
+  }
+  return static_cast<int>(nfe + nfe_ls);
+#endif
+}
+
+template int ReactorCvode::ReactClem<ReactorTypes::e_reactor_type>(
+  amrex::Real, amrex::Real*, amrex::Real&, amrex::Real, amrex::Real,
+  amrex::Real);
+template int ReactorCvode::ReactClem<ReactorTypes::h_reactor_type>(
+  amrex::Real, amrex::Real*, amrex::Real&, amrex::Real, amrex::Real,
+  amrex::Real);
+
+void
+ReactorCvode::CloseClemReactor()
+{
+  if (!m_clem_initialized) {
+    return;
+  }
+  N_VDestroy(m_clem_y);
+  CVodeFree(&m_clem_cvode_mem);
+  if (m_clem_LS != nullptr) {
+    SUNLinSolFree(m_clem_LS);
+  }
+  if (m_clem_NLS != nullptr) {
+    SUNNonlinSolFree(m_clem_NLS);
+  }
+  if (m_clem_A != nullptr) {
+    SUNMatDestroy(m_clem_A);
+  }
+  freeUserData(m_clem_udata);
+
+  m_clem_y = nullptr;
+  m_clem_cvode_mem = nullptr;
+  m_clem_LS = nullptr;
+  m_clem_NLS = nullptr;
+  m_clem_A = nullptr;
+  m_clem_udata = nullptr;
+  m_clem_initialized = false;
+}
+//--------------------------- CLEM IMPLEMENTATION -------------------------
 
 void
 ReactorCvode::print_final_stats(void* cvodemem, bool print_ls_stats) // NOLINT

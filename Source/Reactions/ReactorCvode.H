@@ -109,6 +109,39 @@ public:
   static int
   cF_RHS(amrex::Real t, N_Vector y_in, N_Vector ydot, void* user_data);
 
+  //--------------------------- CLEM IMPLEMENTATION -------------------------
+  // The reactor of the CLEM elements (Source/Clem in PeleC): each element of
+  // a LEM line is a 0-D reactor, constant volume (e reactor) or constant
+  // pressure (h reactor), integrated alone (ncells = 1). CPU only.
+  //
+  // InitClemReactor   : build the CVODE context ONCE, after init(); the
+  //                     tolerances use the typical values set before it
+  // SetClemTolerances : apply the tolerances again, after new typical values
+  //                     (set_typ_vals_ode), to the existing context
+  // ReactClem         : integrate one element, reusing the context
+  //                     (CVodeReInit)
+  // CloseClemReactor  : free the context; also called by close()
+  void InitClemReactor();
+
+  void SetClemTolerances();
+
+  // ReactClem: advance one element over dt_react, with no external source.
+  // rho and energy (specific: e for the e reactor, h for the h reactor) are
+  // held; mass_frac (Y_k) and temperature are advanced in place. ReactorType
+  // must be the type given to init(). Aborts if CVODE fails. Returns the
+  // number of RHS evaluations, the cost of the element
+  template <int ReactorType>
+  int ReactClem(
+    amrex::Real rho,
+    amrex::Real* mass_frac,
+    amrex::Real& temperature,
+    amrex::Real energy,
+    amrex::Real dt_react,
+    amrex::Real time);
+
+  void CloseClemReactor();
+  //--------------------------- CLEM IMPLEMENTATION -------------------------
+
   void flatten(
     const amrex::Box& box,
     const int ncells,
@@ -194,6 +227,15 @@ private:
   int m_analytical_jacobian{-1};
   int m_precond_type{-1};
   bool m_clean_init_massfrac{false};
+
+  // the persistent context of the CLEM reactor (InitClemReactor)
+  bool m_clem_initialized{false};
+  void* m_clem_cvode_mem{nullptr};
+  N_Vector m_clem_y{nullptr};
+  SUNMatrix m_clem_A{nullptr};
+  CVODEUserData* m_clem_udata{nullptr};
+  SUNNonlinearSolver m_clem_NLS{nullptr};
+  SUNLinearSolver m_clem_LS{nullptr};
 };
 } // namespace pele::physics::reactions
 #endif
